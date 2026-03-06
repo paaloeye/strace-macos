@@ -260,3 +260,46 @@ class SummaryFormatter:
         lines.append("")
 
         return "\n".join(lines)
+
+
+class ArgsSummaryFormatter:
+    """Format argument statistics for args-only mode with -c."""
+
+    def __init__(self) -> None:
+        """Initialize the arguments summary formatter."""
+        self.args_counts: dict[str, int] = {}
+        self.total_calls: int = 0
+
+    def add_event(self, event: SyscallEvent) -> None:
+        """Add a syscall event's first argument to the statistics.
+
+        Args:
+            event: The syscall event to record
+        """
+        self.total_calls += 1
+        # Get the first argument as string
+        if event.args:
+            arg_str = str(event.args[0])
+            self.args_counts[arg_str] = self.args_counts.get(arg_str, 0) + 1
+
+    def format(self) -> str:
+        """Format the arguments statistics as a table.
+
+        Returns:
+            Summary table string
+        """
+        if not self.args_counts:
+            return "No arguments captured.\n"
+
+        lines = ["     calls argument"]
+        lines.append("-" * 60)
+
+        # Sort by count descending
+        for arg, count in sorted(self.args_counts.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"{count:10d} {arg}")
+
+        lines.append("-" * 60)
+        lines.append(f"{self.total_calls:10d} total")
+        lines.append("")
+
+        return "\n".join(lines)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import sys
@@ -22,6 +23,7 @@ from strace_macos.syscalls.args import (
 from strace_macos.syscalls.category import SyscallCategory
 from strace_macos.syscalls.definitions import DecodeContext
 from strace_macos.syscalls.formatters import (
+    ArgsSummaryFormatter,
     ColorTextFormatter,
     JSONFormatter,
     SummaryFormatter,
@@ -48,6 +50,7 @@ class Tracer:
     filter_expr: str | None = None
     no_abbrev: bool = False
     follow_forks: bool = False
+    args_only: bool = False
 
     # Runtime state (initialized in __post_init__)
     lldb: Any = field(init=False)
@@ -55,12 +58,15 @@ class Tracer:
     filtered_syscalls: set[str] | None = field(init=False)
     filter_category: SyscallCategory | None = field(init=False)
     summary_formatter: SummaryFormatter = field(init=False)
+    args_summary_formatter: ArgsSummaryFormatter = field(init=False)
     output_handle: TextIO | None = field(init=False)
     formatter: JSONFormatter | TextFormatter | ColorTextFormatter = field(init=False)
     arch: Architecture = field(init=False)
     pending_syscalls: dict[tuple[int, int], SyscallEvent] = field(init=False)
     interrupted: bool = field(init=False)
     decode_ctx: DecodeContext | None = field(init=False, default=None)
+    last_summary_time: float = field(init=False, default=0.0)
+    syscall_count: int = field(init=False, default=0)
 
     # Syscall parameter caches (for cross-parameter context sharing)
     sysctl_mib_cache: dict[int, list[int]] = field(init=False, default_factory=dict)
@@ -82,6 +88,7 @@ class Tracer:
 
         # Setup formatters
         self.summary_formatter = SummaryFormatter()
+        self.args_summary_formatter = ArgsSummaryFormatter()
         self.output_handle = None
 
         # Track pending syscalls (entry without exit yet)
@@ -142,6 +149,44 @@ class Tracer:
         # No filter - trace everything
         return True
 
+    def _print_realtime_summary(self) -> None:
+        """Print realtime summary statistics (used in summary_only mode)."""
+        if not self.output_handle:
+            return
+
+        # Clear screen and move cursor to top (only if output is a TTY)
+        if self.output_handle.isatty():
+            # ANSI escape codes: clear screen and move cursor to home
+            print("\033[2J\033[H", end="", file=self.output_handle)
+
+        # Print summary
+        summary = self.summary_formatter.format()
+        print(summary, end="", file=self.output_handle)
+        print(f"(Live update - Press Ctrl-C to stop)", file=self.output_handle)
+
+        # Flush to ensure immediate display
+        if self.output_handle:
+            self.output_handle.flush()
+
+    def _print_realtime_args_summary(self) -> None:
+        """Print realtime arguments summary (used in args_only + summary_only mode)."""
+        if not self.output_handle:
+            return
+
+        # Clear screen and move cursor to top (only if output is a TTY)
+        if self.output_handle.isatty():
+            # ANSI escape codes: clear screen and move cursor to home
+            print("\033[2J\033[H", end="", file=self.output_handle)
+
+        # Print arguments summary
+        summary = self.args_summary_formatter.format()
+        print(summary, end="", file=self.output_handle)
+        print(f"(Live update - Press Ctrl-C to stop)", file=self.output_handle)
+
+        # Flush to ensure immediate display
+        if self.output_handle:
+            self.output_handle.flush()
+
     def _open_output(self) -> TextIO:
         """Open the output file or return stderr.
 
@@ -169,9 +214,48 @@ class Tracer:
         """
         # Always add to summary
         self.summary_formatter.add_event(event)
+        self.syscall_count += 1
+
+        # Handle args-only mode
+        if self.args_only:
+            self.args_summary_formatter.add_event(event)
+
+            # Skip writing individual events if summary-only mode
+            if self.summary_only:
+                # Print realtime summary every 100 syscalls or every 1 second
+                current_time = time.time()
+                if (self.syscall_count % 100 == 0) or (current_time - self.last_summary_time >= 1.0):
+                    self._print_realtime_args_summary()
+                    self.last_summary_time = current_time
+                return
+
+            # Print just the first argument
+            if event.args:
+                if self.json_output:
+                    # JSON format: output argument value and syscall return value
+                    arg_data = {
+                        "arg": str(event.args[0]),
+                        "return": event.return_value,
+                        "pid": event.pid,
+                        "timestamp": event.timestamp,
+                    }
+                    print(json.dumps(arg_data), file=self.output_handle)
+                else:
+                    # Plain text: just the argument
+                    print(str(event.args[0]), file=self.output_handle)
+
+            # Ensure data is visible immediately
+            if self.output_handle and self.output_file is not None:
+                self.output_handle.flush()
+            return
 
         # Skip writing individual events if summary-only mode
         if self.summary_only:
+            # Print realtime summary every 100 syscalls or every 1 second
+            current_time = time.time()
+            if (self.syscall_count % 100 == 0) or (current_time - self.last_summary_time >= 1.0):
+                self._print_realtime_summary()
+                self.last_summary_time = current_time
             return
 
         # Format and write (print is line-buffered by default)
@@ -246,15 +330,32 @@ class Tracer:
             # Create reusable decode context (avoids allocations in hot path)
             self.decode_ctx = DecodeContext(tracer=self, process=process)
 
-            # Trace syscalls
-            exit_code = self._trace_loop(process)
+            # Set up signal handler for Ctrl-C
+            old_handler = self._setup_signal_handler()
 
-            # Write summary if needed
-            if self.summary_only:
-                summary = self.summary_formatter.format()
-                print(summary, end="", file=self.output_handle)
+            try:
+                # Trace syscalls
+                exit_code = self._trace_loop(process)
 
-            return exit_code
+                # Write final summary if needed
+                if self.summary_only:
+                    # Clear screen for final summary if TTY
+                    if self.output_handle and self.output_handle.isatty():
+                        print("\033[2J\033[H", end="", file=self.output_handle)
+                    # Use appropriate formatter based on args_only mode
+                    if self.args_only:
+                        summary = self.args_summary_formatter.format()
+                    else:
+                        summary = self.summary_formatter.format()
+                    print(summary, end="", file=self.output_handle)
+
+                return exit_code
+
+            finally:
+                # Restore original signal handler
+                if old_handler is not None:
+                    with contextlib.suppress(ValueError):
+                        signal.signal(signal.SIGINT, old_handler)
 
         finally:
             if self.output_handle and self.output_file is not None:
@@ -337,16 +438,25 @@ class Tracer:
                 process.Continue()
                 exit_code = self._trace_loop(process)
                 process.Detach()
+
+                # Write final summary if needed
+                if self.summary_only:
+                    # Clear screen for final summary if TTY
+                    if self.output_handle and self.output_handle.isatty():
+                        print("\033[2J\033[H", end="", file=self.output_handle)
+                    # Use appropriate formatter based on args_only mode
+                    if self.args_only:
+                        summary = self.args_summary_formatter.format()
+                    else:
+                        summary = self.summary_formatter.format()
+                    print(summary, end="", file=self.output_handle)
+
+                return exit_code
+
             finally:
                 if old_handler is not None:
                     with contextlib.suppress(ValueError):
                         signal.signal(signal.SIGINT, old_handler)
-
-            if self.summary_only:
-                summary = self.summary_formatter.format()
-                print(summary, end="", file=self.output_handle)
-
-            return exit_code  # noqa: TRY300
 
         except Exception:  # noqa: BLE001
             return 1

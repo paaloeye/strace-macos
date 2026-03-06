@@ -49,6 +49,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print raw values without symbolic decoding (no abbreviation)",
     )
+    parser.add_argument(
+        "-a",
+        "--args-only",
+        action="store_true",
+        help="Print only the first argument (requires single syscall filter, e.g., -e trace=open)",
+    )
 
     # Filtering options
     parser.add_argument(
@@ -88,6 +94,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.pid is not None and args.command:
         parser.error("Cannot specify both -p PID and COMMAND")
 
+    # Validate: -c and --json are mutually exclusive
+    if args.summary_only and args.json:
+        parser.error("Cannot specify both -c (summary) and --json")
+
+    # Validate: -a requires a single syscall filter
+    if args.args_only:
+        if not args.filter_expr:
+            parser.error("-a (args-only) requires -e trace=<syscall>")
+        if not args.filter_expr.startswith("trace="):
+            parser.error("-a (args-only) requires -e trace=<syscall>")
+        # Check if it's a single syscall (not a comma-separated list or category)
+        trace_value = args.filter_expr[6:]  # Remove "trace=" prefix
+        if "," in trace_value:
+            parser.error("-a (args-only) requires a single syscall, not a list")
+        # Categories that won't work with -a
+        if trace_value in ["file", "network", "process", "memory", "signal", "ipc", "thread", "time", "sysinfo", "security", "debug", "misc"]:
+            parser.error("-a (args-only) requires a single syscall, not a category")
+
     # Import tracer here to avoid loading LLDB until needed
     from strace_macos.tracer import Tracer  # noqa: PLC0415
 
@@ -100,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             filter_expr=args.filter_expr,
             no_abbrev=args.no_abbrev,
             follow_forks=args.follow_forks,
+            args_only=args.args_only,
         )
 
         # Run trace
